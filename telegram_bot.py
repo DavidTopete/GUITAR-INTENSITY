@@ -1137,25 +1137,25 @@ LIMITE_CAPTION = 1024   # pie de foto (caracteres visibles)
 LIMITE_MENSAJE = 4096   # mensaje de texto
 
 
-def mensaje_titulo(titulo_es):
-    """1a parte de la noticia: solo el titulo, en negrita."""
-    return f"<b>{escape(titulo_es)}</b>"
-
-
-def mensaje_cuerpo(parrafo_es, url, limite=LIMITE_MENSAJE,
-                   texto_enlace="Leer la noticia completa"):
-    """2a parte (pie de la foto): el parrafo de resumen y, hasta abajo, el
-    enlace. Si no cabe en `limite`, se acorta el parrafo por oraciones;
-    el enlace siempre se conserva."""
+def mensaje_noticia(titulo_es, parrafo_es, url, limite=LIMITE_MENSAJE,
+                    texto_enlace="Leer la noticia completa"):
+    """Toda la noticia en un solo bloque: titulo en negrita, un parrafo de
+    resumen y, hasta abajo, el enlace. Si no cabe en `limite` (texto de una
+    foto: 1024), se acorta el parrafo por oraciones; el titulo y el enlace
+    siempre se conservan."""
     enlace = f'🔗 <a href="{escape(url)}">{escape(texto_enlace)}</a>'
 
     def armar(parrafo):
-        return f"{escape(parrafo)}\n\n{enlace}" if parrafo else enlace
+        partes = [f"<b>{escape(titulo_es)}</b>"]
+        if parrafo:
+            partes.append(escape(parrafo))
+        partes.append(enlace)
+        return "\n\n".join(partes)
 
     texto = armar(parrafo_es)
     if largo_visible(texto) <= limite:
         return texto
-    disponible = max(0, limite - largo_visible(enlace) - 2)
+    disponible = max(0, limite - largo_visible(armar("")) - 2)
     parrafo = cortar_en_oracion(parrafo_es, disponible) if disponible >= 40 else ""
     return armar(parrafo)
 
@@ -1703,10 +1703,11 @@ class Telegram:
 
     # ------------------------------------------------------------------
 
-    def enviar(self, texto, thread_id=None, url_vista_previa=None, silencioso=False):
+    def enviar(self, texto, thread_id=None, url_vista_previa=None, vista_arriba=False,
+               silencioso=False):
         """Mensaje de texto. Con url_vista_previa, Telegram muestra la vista
-        previa del articulo (su imagen) en grande y encima del texto.
-        silencioso=True no genera notificacion (2a parte de una noticia)."""
+        previa del articulo (su imagen) en grande, debajo del texto o encima
+        (vista_arriba=True)."""
         payload = {"chat_id": self.chat_id, "text": texto, "parse_mode": "HTML"}
         if thread_id is not None:
             payload["message_thread_id"] = int(thread_id)
@@ -1716,7 +1717,7 @@ class Telegram:
             payload["link_preview_options"] = {
                 "url": url_vista_previa,
                 "prefer_large_media": self.vista_grande,
-                "show_above_text": self.vista_grande,
+                "show_above_text": bool(vista_arriba),
             }
         else:
             payload["link_preview_options"] = {"is_disabled": True}
@@ -1725,29 +1726,22 @@ class Telegram:
             return self._simular(thread_id, texto)
         return self._llamar("sendMessage", payload)
 
-    def enviar_foto(self, foto_url, caption, thread_id=None, silencioso=False):
-        """Foto (por URL) con pie en HTML debajo. El pie admite hasta 1024
-        caracteres visibles; quien llama debe respetarlo."""
+    def enviar_foto(self, foto_url, caption, thread_id=None, texto_arriba=False, silencioso=False):
+        """Foto (por URL) con su texto en HTML (max. 1024 caracteres visibles;
+        quien llama debe respetarlo). texto_arriba=True coloca el texto encima
+        de la foto (show_caption_above_media) en el MISMO mensaje."""
         payload = {"chat_id": self.chat_id, "photo": foto_url, "caption": caption,
                    "parse_mode": "HTML"}
+        if texto_arriba:
+            payload["show_caption_above_media"] = True
         if thread_id is not None:
             payload["message_thread_id"] = int(thread_id)
         if silencioso:
             payload["disable_notification"] = True
         if self.dry_run:
-            return self._simular(thread_id, f"[imagen: {foto_url}]\n{caption}", foto=foto_url)
+            vista = f"{caption}\n[imagen: {foto_url}]" if texto_arriba else f"[imagen: {foto_url}]\n{caption}"
+            return self._simular(thread_id, vista, foto=foto_url)
         return self._llamar("sendPhoto", payload)
-
-    def borrar(self, message_id):
-        """deleteMessage: deshace la 1a parte de una noticia si la 2a no se
-        pudo enviar (el bot puede borrar sus propios mensajes)."""
-        if self.dry_run or message_id is None:
-            return True
-        try:
-            return self._llamar("deleteMessage", {"chat_id": self.chat_id,
-                                                  "message_id": int(message_id)}).ok
-        except TelegramInaccesible:
-            return False
 
     def _simular(self, thread_id, texto, foto=None):
         self._id_falso += 1
@@ -1966,51 +1960,37 @@ class Publicador:
             self.db.marcar_envio(clave, self.ahora)
 
     def _enviar(self, g, rep, titulo_es, parrafo_es, destino, imagen=""):
-        """Publica la noticia en este orden: TITULO, FOTO, RESUMEN, ENLACE.
+        """Publica TODA la noticia en un solo mensaje (una sola seccion):
+        titulo en negrita, resumen de un parrafo, enlace y la foto.
 
-        Telegram pone la foto siempre encima de su pie, asi que se envian dos
-        mensajes seguidos en el mismo tema:
-          1) el titulo en negrita (con notificacion)
-          2) la foto con el parrafo y el enlace debajo (sin notificacion)
-        Sin imagen (o si Telegram no puede descargarla), el 2o mensaje es texto
-        con la vista previa del articulo arriba: el orden visual es el mismo.
-        Si el 2o mensaje falla, se borra el 1o para no dejar un titulo suelto
-        ni duplicarlo cuando la noticia se reintente."""
+        Telegram no permite poner la foto en medio de un mensaje: el texto va
+        entero encima o entero debajo de ella. Con `texto_encima_de_la_foto`
+        (por defecto) el titulo queda primero, como en el bot original.
+        Sin imagen (o si Telegram no puede descargarla) se envia como texto
+        con la vista previa del articulo en la misma posicion."""
         thread = self.temas.get(destino)
         enlace = self.pcfg.get("texto_enlace", "Leer la noticia completa")
+        texto_arriba = bool(self.pcfg.get("texto_encima_de_la_foto", True))
 
         if not imagen and self.buscar_imagen:
             imagen = self.buscar_imagen(rep["url"]) or ""
 
-        res_titulo = self.tg.enviar(mensaje_titulo(titulo_es), thread_id=thread)
-        if not res_titulo.ok:
-            return self._registrar_fallo(g, rep, res_titulo)
-
         res = None
         if imagen:
-            pie = mensaje_cuerpo(parrafo_es, rep["url"], limite=LIMITE_CAPTION, texto_enlace=enlace)
-            res = self.tg.enviar_foto(imagen, pie, thread_id=thread, silencioso=True)
+            texto = mensaje_noticia(titulo_es, parrafo_es, rep["url"], limite=LIMITE_CAPTION,
+                                    texto_enlace=enlace)
+            res = self.tg.enviar_foto(imagen, texto, thread_id=thread, texto_arriba=texto_arriba)
             if not res.ok and res.permanente:
                 log.warning(f"Telegram rechazo la imagen ({res.error}); se envia como texto")
                 res = None
         if res is None:
-            texto = mensaje_cuerpo(parrafo_es, rep["url"], texto_enlace=enlace)
+            texto = mensaje_noticia(titulo_es, parrafo_es, rep["url"], texto_enlace=enlace)
             res = self.tg.enviar(texto, thread_id=thread, url_vista_previa=rep["url"],
-                                 silencioso=True)
+                                 vista_arriba=not texto_arriba)
 
         if res.ok:
             self.fallos_envio_consecutivos = 0
-            self.db.marcar_publicada(g["id"], destino, res_titulo.message_id, self.ahora,
-                                     titulo=titulo_es, fuente=rep["fuente"])
-            return True
-
-        # Fallo la 2a parte: deshacer la 1a.
-        if not self.tg.borrar(res_titulo.message_id):
-            # No se pudo borrar el titulo: se da por publicada para no
-            # repetir el titulo en la proxima ejecucion.
-            log.error(f"No se pudo completar ni deshacer la noticia; se marca publicada: "
-                      f"{rep['titulo'][:70]}")
-            self.db.marcar_publicada(g["id"], destino, res_titulo.message_id, self.ahora,
+            self.db.marcar_publicada(g["id"], destino, res.message_id, self.ahora,
                                      titulo=titulo_es, fuente=rep["fuente"])
             return True
         return self._registrar_fallo(g, rep, res)
@@ -2438,6 +2418,7 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
                  'encabezado': True,
                  'buscar_imagen_en_articulo': True,
                  'texto_enlace': 'Leer la noticia completa',
+                 'texto_encima_de_la_foto': True,
                  'alerta_feed_fallos': 2,
                  'reporte_estado': True,
                  'calendario': {'lunes': {'guitarra': 5},

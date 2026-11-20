@@ -57,7 +57,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -150,6 +150,83 @@ def truncar(texto, maximo, sufijo="…"):
     if espacio > maximo * 0.6:
         corte = corte[:espacio]
     return corte.rstrip(" ,;:.-–—") + sufijo
+
+
+_FINES_ORACION = ".!?…。！？"
+
+
+def cortar_en_oracion(texto, maximo):
+    """Un solo parrafo de como maximo `maximo` caracteres, cortado al final
+    de una oracion (tambien con puntuacion japonesa). Si no hay un final de
+    oracion razonable, corta en limite de palabra con '…'."""
+    texto = " ".join((texto or "").split())
+    if len(texto) <= maximo:
+        return texto
+    corte = texto[:maximo]
+    pos = max(corte.rfind(c) for c in _FINES_ORACION)
+    if pos >= maximo * 0.4:
+        return corte[:pos + 1]
+    return truncar(texto, maximo)
+
+
+def primer_parrafo(html_texto, minimo=60, maximo=500):
+    """Primer parrafo con contenido real de un fragmento HTML (descripcion o
+    content:encoded del feed), ya limpio y recortado a oraciones completas."""
+    if not html_texto:
+        return ""
+    soup = BeautifulSoup(html_texto, "html.parser")
+    bloques = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+    if not bloques:
+        bloques = [soup.get_text(" ", strip=True)]
+    limpios = [limpiar_resumen(b) for b in bloques]
+    limpios = [b for b in limpios if b]
+    if not limpios:
+        return ""
+    elegido = next((b for b in limpios if len(b) >= minimo), limpios[0])
+    return cortar_en_oracion(elegido, maximo)
+
+
+_EXT_NO_FOTO = (".svg", ".ico")
+_PISTAS_PIXEL = ("pixel", "spacer", "blank.gif", "1x1", "feedburner", "gravatar", "emoji")
+
+
+def imagen_valida(url):
+    """Telegram necesita una URL http(s) a un JPG/PNG/WebP/GIF real."""
+    if not url or not url.startswith(("http://", "https://")):
+        return False
+    bajo = url.lower().split("?")[0]
+    if bajo.endswith(_EXT_NO_FOTO):
+        return False
+    return not any(p in url.lower() for p in _PISTAS_PIXEL)
+
+
+def imagen_en_html(html_texto, base=""):
+    """Primera imagen util de un fragmento HTML (src, data-src o srcset)."""
+    if not html_texto or "<img" not in html_texto:
+        return ""
+    soup = BeautifulSoup(html_texto, "html.parser")
+    for img in soup.find_all("img"):
+        try:
+            if int(img.get("width") or 99) < 50 or int(img.get("height") or 99) < 50:
+                continue  # iconos y pixeles de seguimiento
+        except ValueError:
+            pass
+        src = img.get("src") or img.get("data-src") or ""
+        if not src and img.get("srcset"):
+            src = img["srcset"].split(",")[-1].strip().split(" ")[0]
+        src = urljoin(base, src.strip()) if src else ""
+        if imagen_valida(src):
+            return src
+    return ""
+
+
+def absoluta(url, base):
+    return urljoin(base, url.strip()) if url else ""
+
+
+def largo_visible(html_texto):
+    """Caracteres que cuenta Telegram: sin etiquetas y con entidades resueltas."""
+    return len(html.unescape(re.sub(r"<[^>]+>", "", html_texto or "")))
 
 
 def contiene_japones(texto):
@@ -293,6 +370,7 @@ class Entrada:
     resumen: str = ""
     contenido: str = ""
     fecha: datetime | None = None
+    imagen: str = ""
 
 
 class ErrorFeed(Exception):
@@ -363,14 +441,48 @@ def _parsear_feedparser(contenido):
         contenido_html = ""
         if e.get("content"):
             contenido_html = e.content[0].get("value", "")
+        link = e.get("link", "") or ""
+        resumen = e.get("summary", "") or ""
+        candidatas = []
+        for m in e.get("media_content", []) or []:
+            tipo = (m.get("type") or "") + (m.get("medium") or "")
+            if "image" in tipo or not tipo:
+                candidatas.append((_ancho(m.get("width")), m.get("url")))
+        for m in e.get("media_thumbnail", []) or []:
+            candidatas.append((_ancho(m.get("width")), m.get("url")))
+        for enc in e.get("enclosures", []) or []:
+            if (enc.get("type") or "").startswith("image"):
+                candidatas.append((0, enc.get("href") or enc.get("url")))
         entradas.append(Entrada(
             titulo=e.get("title", "") or "",
-            link=e.get("link", "") or "",
-            resumen=e.get("summary", "") or "",
+            link=link,
+            resumen=resumen,
             contenido=contenido_html,
             fecha=_fecha_struct(e.get("published_parsed") or e.get("updated_parsed")),
+            imagen=_elegir_imagen(candidatas, link, contenido_html, resumen),
         ))
     return entradas
+
+
+def _ancho(valor):
+    try:
+        return int(str(valor).strip("px"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _elegir_imagen(candidatas, link, *htmls):
+    """La mayor imagen declarada en el feed (media:content, media:thumbnail,
+    enclosure). Si no hay, la primera <img> util del contenido o resumen."""
+    validas = [(ancho, absoluta(url, link)) for ancho, url in candidatas if url]
+    validas = [(a, u) for a, u in validas if imagen_valida(u)]
+    if validas:
+        return max(validas, key=lambda t: t[0])[1]
+    for h in htmls:
+        img = imagen_en_html(h, link)
+        if img:
+            return img
+    return ""
 
 
 def _local(tag):
@@ -415,12 +527,15 @@ def _parsear_basico(contenido):
     for nodo in raiz.iter():
         nombre = _local(nodo.tag)
         if nombre == "item":  # RSS
+            link = _texto(nodo, "link")
+            resumen, contenido = _texto(nodo, "description"), _texto(nodo, "encoded")
             entradas.append(Entrada(
                 titulo=_texto(nodo, "title"),
-                link=_texto(nodo, "link"),
-                resumen=_texto(nodo, "description"),
-                contenido=_texto(nodo, "encoded"),
+                link=link,
+                resumen=resumen,
+                contenido=contenido,
                 fecha=_fecha_texto(_texto(nodo, "pubDate") or _texto(nodo, "date")),
+                imagen=_elegir_imagen(_imagenes_media(nodo), link, contenido, resumen),
             ))
         elif nombre == "entry":  # Atom
             link = ""
@@ -428,14 +543,55 @@ def _parsear_basico(contenido):
                 if _local(h.tag) == "link" and h.get("rel", "alternate") == "alternate":
                     link = h.get("href", "")
                     break
+            resumen, contenido = _texto(nodo, "summary"), _texto(nodo, "content")
             entradas.append(Entrada(
                 titulo=_texto(nodo, "title"),
                 link=link,
-                resumen=_texto(nodo, "summary"),
-                contenido=_texto(nodo, "content"),
+                resumen=resumen,
+                contenido=contenido,
                 fecha=_fecha_texto(_texto(nodo, "published") or _texto(nodo, "updated")),
+                imagen=_elegir_imagen(_imagenes_media(nodo), link, contenido, resumen),
             ))
     return entradas
+
+
+def _imagenes_media(nodo):
+    """media:content / media:thumbnail / enclosure de un item (parser basico)."""
+    candidatas = []
+    for h in nodo.iter():
+        local = _local(h.tag)
+        url = h.get("url")
+        if not url:
+            continue
+        tipo = (h.get("type") or "") + (h.get("medium") or "")
+        if local == "thumbnail" or (local == "content" and ("image" in tipo or not tipo)) \
+                or (local == "enclosure" and "image" in tipo):
+            candidatas.append((_ancho(h.get("width")), url))
+    return candidatas
+
+
+# ---------------------------------------------------------------------------
+# Imagen del articulo (respaldo cuando el feed no trae ninguna)
+# ---------------------------------------------------------------------------
+
+def imagen_de_articulo(url, timeout=10):
+    """og:image / twitter:image de la pagina. Solo se usa al PUBLICAR (una
+    peticion por noticia publicada), nunca al recolectar."""
+    try:
+        r = requests.get(url, headers=HEADERS_HTTP, timeout=timeout)
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        log.info(f"Sin imagen del articulo ({type(e).__name__}): {url}")
+        return ""
+    soup = BeautifulSoup(r.text[:300000], "html.parser")
+    for attr, valor in (("property", "og:image"), ("property", "og:image:url"),
+                        ("name", "twitter:image"), ("name", "twitter:image:src")):
+        meta = soup.find("meta", attrs={attr: valor})
+        if meta and meta.get("content"):
+            img = absoluta(meta["content"], url)
+            if imagen_valida(img):
+                return img
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +831,7 @@ CREATE TABLE IF NOT EXISTS items (
     puntos          TEXT NOT NULL DEFAULT '{}',
     segmento        TEXT NOT NULL DEFAULT '',
     marcas          TEXT NOT NULL DEFAULT '[]',
+    imagen          TEXT NOT NULL DEFAULT '',
     fecha_feed      TEXT,
     detectado_en    TEXT NOT NULL
 );
@@ -727,7 +884,20 @@ class BaseDatos:
         self.con.row_factory = sqlite3.Row
         self.con.execute("PRAGMA foreign_keys = ON")
         self.con.executescript(ESQUEMA)
+        self._migrar_esquema()
         self.con.commit()
+
+    def _migrar_esquema(self):
+        """Columnas nuevas en bases creadas con versiones anteriores."""
+        nuevas = {
+            "items": {"imagen": "TEXT NOT NULL DEFAULT ''"},
+            "grupos": {"titulo_publicado": "TEXT", "fuente_publicada": "TEXT"},
+        }
+        for tabla, columnas in nuevas.items():
+            existentes = {r["name"] for r in self.con.execute(f"PRAGMA table_info({tabla})")}
+            for col, tipo in columnas.items():
+                if col not in existentes:
+                    self.con.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
 
     @classmethod
     def copia_en_memoria(cls, ruta):
@@ -792,13 +962,13 @@ class BaseDatos:
     def anadir_item(self, grupo_id, item, ahora):
         self.con.execute(
             "INSERT OR IGNORE INTO items(grupo_id, url_norm, url, fuente, editorial, idioma, "
-            "titulo, resumen, extraer_articulo, puntos, segmento, marcas, fecha_feed, detectado_en) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "titulo, resumen, extraer_articulo, puntos, segmento, marcas, imagen, fecha_feed, "
+            "detectado_en) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (grupo_id, item["url_norm"], item["url"], item["fuente"], item.get("editorial"),
              item["idioma"], item["titulo"], item.get("resumen", ""),
              int(bool(item.get("extraer_articulo"))), json.dumps(item.get("puntos", {})),
              item.get("segmento", ""), json.dumps(item.get("marcas", [])),
-             item.get("fecha_feed"), iso(ahora)))
+             item.get("imagen", ""), item.get("fecha_feed"), iso(ahora)))
         self._recalcular_grupo(grupo_id, ahora)
 
     def _recalcular_grupo(self, grupo_id, ahora):
@@ -963,38 +1133,35 @@ class BaseDatos:
 NOMBRE_DIAS = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
 
 
-def mensaje_noticia(item, titulo_es, resumen_es, instrumento_cfg, cfg,
-                    destacada=False, n_fuentes=1, expandible=True):
-    pcfg = cfg.get("publicacion", {})
-    visible = pcfg.get("largo_resumen_visible", 300)
+LIMITE_CAPTION = 1024   # pie de foto (caracteres visibles)
+LIMITE_MENSAJE = 4096   # mensaje de texto
 
-    contexto = [f"{instrumento_cfg.get('emoji', '')} <b>{escape(instrumento_cfg['nombre'].upper())}</b>".strip()]
-    if item.get("segmento"):
-        contexto.append(escape(item["segmento"]))
-    contexto.append(escape(item["fuente"]))
-    lineas = []
-    if destacada:
-        lineas.append(f"⭐ <b>DESTACADA</b> · cubierta por {n_fuentes} fuentes")
-    lineas.append(" · ".join(contexto))
-    lineas.append(f"<b>{escape(titulo_es)}</b>")
 
-    if resumen_es:
-        lineas.append("")
-        if expandible and len(resumen_es) > visible:
-            lineas.append(f"<blockquote expandable>{escape(resumen_es)}</blockquote>")
-        else:
-            lineas.append(escape(truncar(resumen_es, visible)))
+def mensaje_noticia(titulo_es, parrafo_es, url, limite=LIMITE_MENSAJE,
+                    texto_enlace="Leer la noticia completa"):
+    """Presentacion del bot original: titulo en negrita, un parrafo de
+    resumen y el enlace a la noticia. Si no cabe en `limite` (p. ej. pie de
+    foto), se acorta el parrafo por oraciones, nunca el titulo ni el enlace."""
+    def armar(parrafo):
+        partes = [f"<b>{escape(titulo_es)}</b>"]
+        if parrafo:
+            partes.append(escape(parrafo))
+        partes.append(f'🔗 <a href="{escape(url)}">{escape(texto_enlace)}</a>')
+        return "\n\n".join(partes)
 
-    etiquetas = [instrumento_cfg.get("hashtag") or hashtag(instrumento_cfg["nombre"])]
-    if item.get("segmento"):
-        etiquetas.append(hashtag(item["segmento"]))
-    etiquetas.extend(item.get("marcas") or [])
-    etiquetas = [e for e in dict.fromkeys(etiquetas) if e]
-    lineas.append("")
-    if etiquetas:
-        lineas.append(" ".join(f"#{e}" for e in etiquetas))
-    lineas.append(f'🔗 <a href="{escape(item["url"])}">Leer artículo</a>')
-    return "\n".join(lineas)
+    texto = armar(parrafo_es)
+    if largo_visible(texto) <= limite:
+        return texto
+    fijo = largo_visible(armar(""))
+    disponible = max(0, limite - fijo - 2)
+    parrafo = cortar_en_oracion(parrafo_es, disponible) if disponible >= 40 else ""
+    return armar(parrafo)
+
+
+def mensaje_encabezado(emoji, titulo, fecha_local):
+    """Encabezado del dia, igual que el bot original."""
+    return (f"{emoji} <b>{escape(titulo)}</b>\n\n"
+            f"<b>Fecha:</b> {fecha_local.strftime('%d/%m/%Y')}\n").lstrip()
 
 
 def mensaje_estado(ahora_local, datos):
@@ -1170,6 +1337,7 @@ def recolectar(cfg, db, clasificador, ahora, leer_fuente=None, pausa=None):
     max_entradas = g.get("max_entradas_por_feed", 25)
     tr = cfg.get("traduccion", {})
     max_titulo = tr.get("max_largo_titulo", 250)
+    max_parrafo = g.get("largo_parrafo_original", 500)
 
     agrupador = Agrupador(
         db.grupos_desde(ahora - timedelta(hours=cfg["agrupacion"].get("ventana_horas", 72))),
@@ -1204,9 +1372,12 @@ def recolectar(cfg, db, clasificador, ahora, leer_fuente=None, pausa=None):
             if db.url_conocida(url_norm):
                 continue
 
-            # El contenido completo (content:encoded) suele ser mejor que el
-            # extracto, sobre todo en fuentes japonesas.
-            resumen = limpiar_resumen(e.contenido) or limpiar_resumen(e.resumen)
+            # Un solo parrafo: el extracto del feed suele ser el mejor resumen;
+            # si es muy corto se usa el primer parrafo del contenido completo.
+            minimo = 30 if fuente.get("idioma") == "ja" else 60
+            resumen = primer_parrafo(e.resumen, minimo, max_parrafo)
+            if len(resumen) < minimo:
+                resumen = primer_parrafo(e.contenido, minimo, max_parrafo) or resumen
 
             clas = clasificador.clasificar(titulo, resumen, fuente)
             if clas is None:
@@ -1228,6 +1399,7 @@ def recolectar(cfg, db, clasificador, ahora, leer_fuente=None, pausa=None):
                 "titulo": titulo, "resumen": resumen,
                 "extraer_articulo": fuente.get("extraer_articulo", False),
                 "puntos": clas.puntos, "segmento": clas.segmento, "marcas": clas.marcas,
+                "imagen": getattr(e, "imagen", "") or "",
                 "fecha_feed": iso(e.fecha) if e.fecha else None,
             }
 
@@ -1371,50 +1543,51 @@ class Traductor:
             raise FalloTraduccion(f"inesperado: {type(e).__name__}") from None
 
     def preparar(self, item):
-        """Devuelve (titulo_es, resumen_es). Lanza FalloTraduccion si la
-        noticia no es publicable segun la politica estricta."""
+        """Devuelve (titulo_es, parrafo_es): titulo y UN parrafo de resumen en
+        espanol. Lanza FalloTraduccion si la noticia no es publicable segun la
+        politica estricta (sin titulo traducido no se publica)."""
         idioma = item["idioma"]
         max_titulo = self.cfg.get("max_largo_titulo", 250)
-        max_resumen = self.cfg.get("max_largo_resumen", 700)
+        max_parrafo = self.cfg.get("max_largo_parrafo", self.cfg.get("max_largo_resumen", 450))
         exigir_resumen = self.cfg.get("exigir_resumen_traducido", False)
 
         titulo = truncar(item["titulo"], max_titulo, sufijo="")
         resumen = item.get("resumen", "") or ""
 
         if idioma == "es":
-            return titulo, truncar(resumen, max_resumen)
+            return titulo, cortar_en_oracion(resumen, max_parrafo)
 
         if not self.disponible:
             raise FalloTraduccion("sin traductor")
 
         if idioma == "ja":
             origen, validador_t = "ja", validador_sin_japones
-            # Si el feed no trae cuerpo, se lee el articulo (perezoso: solo
-            # despues de que el titulo se haya traducido).
-            max_texto = self.cfg.get("max_texto_articulo_ja", 1500)
+            max_origen = self.cfg.get("max_texto_articulo_ja", 400)
         else:
             origen, validador_t = None, validador_no_identica(titulo)
-            max_texto = max_resumen
+            max_origen = max_parrafo
 
         titulo_es = self._traducir(titulo, origen, validador_t)
 
-        if idioma == "ja" and item.get("extraer_articulo") and len(resumen) < 200:
+        # Fuente japonesa sin cuerpo en el feed: se lee el articulo, pero solo
+        # despues de que el titulo se haya traducido (no se gasta en vano).
+        if idioma == "ja" and item.get("extraer_articulo") and len(resumen) < 120:
             if self._extraer_articulo:
                 resumen = self._extraer_articulo(item["url"]) or resumen
 
-        resumen = truncar(resumen, max_texto, sufijo="")
-        resumen_es = ""
+        resumen = cortar_en_oracion(resumen, max_origen)
+        parrafo_es = ""
         if resumen:
             validador_r = validador_sin_japones if idioma == "ja" else validador_no_identica(resumen)
             try:
-                resumen_es = limpiar_html(self._traducir(resumen, origen, validador_r))
+                parrafo_es = limpiar_html(self._traducir(resumen, origen, validador_r))
             except FalloTraduccion:
                 if exigir_resumen:
                     raise
-                log.warning(f"Resumen sin traducir, se publica solo el titulo: {titulo[:60]}")
-                resumen_es = ""
+                log.warning(f"Resumen sin traducir, se publica sin resumen: {titulo[:60]}")
+                parrafo_es = ""
 
-        return titulo_es, truncar(resumen_es, max_resumen)
+        return titulo_es, cortar_en_oracion(parrafo_es, max_parrafo)
 
 
 class TraductorNulo(Traductor):
@@ -1436,7 +1609,7 @@ class TraductorNulo(Traductor):
 
     def preparar(self, item):
         titulo = truncar(item["titulo"], self.cfg.get("max_largo_titulo", 250), sufijo="")
-        resumen = truncar(item.get("resumen", ""), self.cfg.get("max_largo_resumen", 700))
+        resumen = cortar_en_oracion(item.get("resumen", ""), self.cfg.get("max_largo_parrafo", 450))
         if item["idioma"] == "es":
             return titulo, resumen
         return f"[{item['idioma']}] {titulo}", resumen
@@ -1477,7 +1650,7 @@ class Telegram:
         tcfg = cfg.get("telegram", {})
         self.ritmo = float(tcfg.get("ritmo_segundos", 3.5))
         self.max_429 = int(tcfg.get("max_reintentos_429", 3))
-        self.vista_pequena = bool(tcfg.get("vista_previa_pequena", True))
+        self.vista_grande = bool(tcfg.get("vista_previa_grande", True))
         self.dry_run = dry_run
         self._dormir = dormir
         self._reloj = reloj
@@ -1529,22 +1702,40 @@ class Telegram:
     # ------------------------------------------------------------------
 
     def enviar(self, texto, thread_id=None, url_vista_previa=None):
+        """Mensaje de texto. Con url_vista_previa, Telegram muestra la vista
+        previa del articulo (su imagen) en grande y encima del texto."""
         payload = {"chat_id": self.chat_id, "text": texto, "parse_mode": "HTML"}
         if thread_id is not None:
             payload["message_thread_id"] = int(thread_id)
         if url_vista_previa:
             payload["link_preview_options"] = {
-                "url": url_vista_previa, "prefer_small_media": self.vista_pequena}
+                "url": url_vista_previa,
+                "prefer_large_media": self.vista_grande,
+                "show_above_text": self.vista_grande,
+            }
         else:
             payload["link_preview_options"] = {"is_disabled": True}
 
         if self.dry_run:
-            self._id_falso += 1
-            self.enviados.append({"thread_id": thread_id, "texto": texto})
-            print(f"\n----- [dry-run] tema={thread_id} -----\n{texto}\n")
-            return Resultado(True, message_id=self._id_falso)
-
+            return self._simular(thread_id, texto)
         return self._llamar("sendMessage", payload)
+
+    def enviar_foto(self, foto_url, caption, thread_id=None):
+        """Foto (por URL) con pie en HTML. El pie admite hasta 1024
+        caracteres visibles; quien llama debe respetarlo."""
+        payload = {"chat_id": self.chat_id, "photo": foto_url, "caption": caption,
+                   "parse_mode": "HTML"}
+        if thread_id is not None:
+            payload["message_thread_id"] = int(thread_id)
+        if self.dry_run:
+            return self._simular(thread_id, f"[imagen: {foto_url}]\n{caption}", foto=foto_url)
+        return self._llamar("sendPhoto", payload)
+
+    def _simular(self, thread_id, texto, foto=None):
+        self._id_falso += 1
+        self.enviados.append({"thread_id": thread_id, "texto": texto, "foto": foto})
+        print(f"\n----- [dry-run] tema={thread_id} -----\n{texto}\n")
+        return Resultado(True, message_id=self._id_falso)
 
     def crear_tema(self, nombre):
         """createForumTopic: requiere que el bot sea admin con permiso
@@ -1625,7 +1816,7 @@ class CircuitBreaker:
 
 
 class Publicador:
-    def __init__(self, cfg, db, telegram, traductor, ahora, tz):
+    def __init__(self, cfg, db, telegram, traductor, ahora, tz, buscar_imagen=None):
         self.cfg = cfg
         self.db = db
         self.tg = telegram
@@ -1639,7 +1830,8 @@ class Publicador:
                                       trcfg.get("max_fallos_tras_exito", 15))
         self.max_intentos = trcfg.get("max_intentos_por_noticia", 3)
         self.temas = cfg.get("telegram", {}).get("temas", {}) or {}
-        self.expandible = bool(cfg.get("telegram", {}).get("resumen_expandible", True))
+        # Respaldo de imagen (og:image del articulo) si el feed no trae ninguna.
+        self.buscar_imagen = buscar_imagen if self.pcfg.get("buscar_imagen_en_articulo", True) else None
         self.envio_caido = False
         self.fallos_envio_consecutivos = 0
         self.stats = {"por_destino": {}, "descartadas_traduccion": 0, "fallos_envio": 0,
@@ -1656,9 +1848,10 @@ class Publicador:
 
     @staticmethod
     def representante(items):
-        """Prefiere espanol (no gasta traductor), luego el resumen mas
-        completo, luego el primero que llego."""
-        return sorted(items, key=lambda i: (i["idioma"] != "es", -len(i["resumen"] or ""), i["id"]))[0]
+        """Prefiere espanol (no gasta traductor), luego con imagen, luego el
+        resumen mas completo, luego el primero que llego."""
+        return sorted(items, key=lambda i: (i["idioma"] != "es", not i.get("imagen"),
+                                            -len(i["resumen"] or ""), i["id"]))[0]
 
     def _ordenar(self, grupos):
         con_puntos = []
@@ -1672,7 +1865,7 @@ class Publicador:
     # Nucleo: publicar un lote en un destino
     # ------------------------------------------------------------------
 
-    def _publicar_lote(self, destino, grupos, cupo, destacada=False):
+    def _publicar_lote(self, destino, grupos, cupo):
         ya_hoy = self.db.publicadas_desde(self.inicio_dia, destino=destino)
         restante = max(0, cupo - len(ya_hoy))
         registro = self.stats["por_destino"].setdefault(destino, {"publicadas": 0, "cupo": cupo})
@@ -1684,7 +1877,7 @@ class Publicador:
         por_fuente = Counter(g["fuente_publicada"] for g in ya_hoy)
         publicadas = 0
 
-        for _, n_fuentes, g in self._ordenar(grupos):
+        for _, _n, g in self._ordenar(grupos):
             if publicadas >= restante or self.envio_caido:
                 break
             g = self.db.grupo(g["id"])
@@ -1724,7 +1917,9 @@ class Publicador:
             if necesita_traduccion:
                 self.breaker.exito()
 
-            if self._enviar(g, rep, titulo_es, resumen_es, destino, destacada, n_fuentes):
+            imagen = rep.get("imagen") or next((i["imagen"] for i in items if i.get("imagen")), "")
+            self._encabezado(destino)
+            if self._enviar(g, rep, titulo_es, resumen_es, destino, imagen):
                 publicadas += 1
                 por_fuente[rep["fuente"]] += 1
                 log.info(f"[{destino} {publicadas}/{restante}] {rep['fuente']}: {rep['titulo'][:70]}")
@@ -1732,22 +1927,46 @@ class Publicador:
         registro["publicadas"] += publicadas
         return publicadas
 
-    def _enviar(self, g, rep, titulo_es, resumen_es, destino, destacada, n_fuentes):
-        inst_cfg = self.cfg["instrumentos"][g["instrumento"]]
-        item = dict(rep)
-        item["marcas"] = _json_lista(rep.get("marcas"))
+    def _encabezado(self, destino):
+        """Encabezado del dia (estilo del bot original), una sola vez por
+        destino y dia, y solo cuando de verdad se va a publicar algo."""
+        if not self.pcfg.get("encabezado", True):
+            return
+        clave = f"encabezado-{destino}-{self.local:%Y-%m-%d}"
+        if self.db.envio_hecho(clave):
+            return
+        if destino == "destacadas":
+            dcfg = self.pcfg.get("destacadas", {})
+            emoji, titulo = dcfg.get("emoji", "⭐"), dcfg.get("encabezado", "NOTICIAS DESTACADAS")
+        else:
+            icfg = self.cfg["instrumentos"].get(destino, {})
+            emoji = icfg.get("emoji", "")
+            titulo = icfg.get("encabezado", f"{icfg.get('nombre', destino).upper()} NEWS")
+        res = self.tg.enviar(mensaje_encabezado(emoji, titulo, self.local),
+                             thread_id=self.temas.get(destino))
+        if res.ok:
+            self.db.marcar_envio(clave, self.ahora)
+
+    def _enviar(self, g, rep, titulo_es, parrafo_es, destino, imagen=""):
+        """Foto + titulo + parrafo + enlace. Si no hay imagen, o Telegram no
+        puede descargarla, se envia como texto con la vista previa grande del
+        articulo (que normalmente muestra su imagen)."""
         thread = self.temas.get(destino)
+        enlace = self.pcfg.get("texto_enlace", "Leer la noticia completa")
 
-        texto = mensaje_noticia(item, titulo_es, resumen_es, inst_cfg, self.cfg,
-                                destacada=destacada, n_fuentes=n_fuentes, expandible=self.expandible)
-        res = self.tg.enviar(texto, thread_id=thread, url_vista_previa=rep["url"])
+        if not imagen and self.buscar_imagen:
+            imagen = self.buscar_imagen(rep["url"]) or ""
 
-        if not res.ok and res.permanente and self.expandible and resumen_es:
-            # Reintento con formato simple (sin blockquote) por si el 400 era
-            # de formato: no se descarta una noticia por la plantilla.
-            log.warning(f"Telegram rechazo el mensaje ({res.error}); reintento en formato simple")
-            texto = mensaje_noticia(item, titulo_es, resumen_es, inst_cfg, self.cfg,
-                                    destacada=destacada, n_fuentes=n_fuentes, expandible=False)
+        res = None
+        if imagen:
+            pie = mensaje_noticia(titulo_es, parrafo_es, rep["url"], limite=LIMITE_CAPTION,
+                                  texto_enlace=enlace)
+            res = self.tg.enviar_foto(imagen, pie, thread_id=thread)
+            if not res.ok and res.permanente:
+                log.warning(f"Telegram rechazo la imagen ({res.error}); se envia como texto")
+                res = None
+        if res is None:
+            texto = mensaje_noticia(titulo_es, parrafo_es, rep["url"], texto_enlace=enlace)
             res = self.tg.enviar(texto, thread_id=thread, url_vista_previa=rep["url"])
 
         if res.ok:
@@ -1784,8 +2003,7 @@ class Publicador:
             self.stats["por_destino"].setdefault(
                 "destacadas", {"publicadas": 0, "cupo": dcfg.get("max_por_dia", 3)})
             return 0
-        return self._publicar_lote("destacadas", candidatos, dcfg.get("max_por_dia", 3),
-                                   destacada=True)
+        return self._publicar_lote("destacadas", candidatos, dcfg.get("max_por_dia", 3))
 
     def calendario(self, dia=None):
         dia = dia or nombre_dia(self.local)
@@ -1836,16 +2054,6 @@ class Publicador:
         self.stats["breaker"] = self.breaker.motivo
         self.stats["dia"] = dia
         return self.stats
-
-
-def _json_lista(valor):
-    import json
-    if isinstance(valor, list):
-        return valor
-    try:
-        return json.loads(valor or "[]")
-    except ValueError:
-        return []
 
 
 # =============================================================================
@@ -1933,7 +2141,7 @@ def cmd_recolectar(cfg, db, args, ahora):
 def cmd_publicar(cfg, db, args, ahora, tz, stats_recoleccion=None):
     tg = crear_telegram(cfg, args)
     tr = crear_traductor(cfg, args)
-    pub = Publicador(cfg, db, tg, tr, ahora, tz)
+    pub = Publicador(cfg, db, tg, tr, ahora, tz, buscar_imagen=feeds.imagen_de_articulo)
     try:
         stats = pub.ejecutar(dia=args.dia)
     except TelegramInaccesible as e:
@@ -2158,6 +2366,7 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
              'dias_historial_titulos': 45,
              'dias_historial_urls': 365,
              'max_entradas_por_feed': 25,
+             'largo_parrafo_original': 500,
              'timeout_http': 15,
              'pausa_entre_feeds': 1,
              'historiales_json': ['noticias_enviadas.json', 'noticias_enviadas_bass.json'],
@@ -2172,8 +2381,7 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
                         'estado': None},
               'ritmo_segundos': 3.5,
               'max_reintentos_429': 3,
-              'resumen_expandible': True,
-              'vista_previa_pequena': True},
+              'vista_previa_grande': True},
  'agrupacion': {'ventana_horas': 72,
                 'umbral_jaccard': 0.7,
                 'umbral_solapamiento': 0.8,
@@ -2183,10 +2391,12 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
                 'max_fallos_tras_exito': 15,
                 'max_intentos_por_noticia': 3,
                 'max_largo_titulo': 250,
-                'max_largo_resumen': 700,
-                'max_texto_articulo_ja': 1500},
+                'max_largo_parrafo': 450,
+                'max_texto_articulo_ja': 400},
  'publicacion': {'max_por_fuente': 2,
-                 'largo_resumen_visible': 300,
+                 'encabezado': True,
+                 'buscar_imagen_en_articulo': True,
+                 'texto_enlace': 'Leer la noticia completa',
                  'alerta_feed_fallos': 2,
                  'reporte_estado': True,
                  'calendario': {'lunes': {'guitarra': 5},
@@ -2201,6 +2411,8 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
                                             'bateria': 1,
                                             'proaudio': 1}},
                  'destacadas': {'activo': True,
+                                'emoji': '⭐',
+                                'encabezado': 'NOTICIAS DESTACADAS',
                                 'fuentes_minimas': 3,
                                 'ventana_horas': 48,
                                 'max_por_dia': 3},
@@ -2319,7 +2531,8 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
             'Meyer Sound',
             'Avid',
             'Steinberg'],
- 'instrumentos': {'guitarra': {'nombre': 'Guitarra',
+ 'instrumentos': {'guitarra': {'encabezado': 'GUITAR GEAR NEWS',
+                               'nombre': 'Guitarra',
                                'emoji': '🎸',
                                'hashtag': 'guitarra',
                                'filtrar_ruido': True,
@@ -2387,7 +2600,8 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
                                                   'guitarrista',
                                                   'pedal de efectos'],
                                'exclusiones': ['bass guitar', 'bassist', 'drummer', 'keyboardist']},
-                  'bajo': {'nombre': 'Bajo',
+                  'bajo': {'encabezado': 'BASS NEWS',
+                           'nombre': 'Bajo',
                            'emoji': '🎵',
                            'hashtag': 'bajo',
                            'filtrar_ruido': True,
@@ -2426,7 +2640,8 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
                                               'bajo electrico',
                                               'contrabajo'],
                            'exclusiones': ['bass music', 'bass boost', 'bass fishing', 'bassoon']},
-                  'teclados': {'nombre': 'Teclados',
+                  'teclados': {'encabezado': 'KEYBOARD NEWS',
+                               'nombre': 'Teclados',
                                'emoji': '🎹',
                                'hashtag': 'teclados',
                                'filtrar_ruido': True,
@@ -2478,7 +2693,8 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
                                                'guitar synth',
                                                'drum machine',
                                                'drum synth']},
-                  'bateria': {'nombre': 'Batería',
+                  'bateria': {'encabezado': 'DRUM NEWS',
+                              'nombre': 'Batería',
                               'emoji': '🥁',
                               'hashtag': 'bateria',
                               'filtrar_ruido': True,
@@ -2550,7 +2766,8 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
                                               'beatmaker',
                                               'eardrum',
                                               'drum up']},
-                  'proaudio': {'nombre': 'Pro Audio',
+                  'proaudio': {'encabezado': 'PRO AUDIO NEWS',
+                               'nombre': 'Pro Audio',
                                'emoji': '🎛️',
                                'hashtag': 'proaudio',
                                'filtrar_ruido': True,

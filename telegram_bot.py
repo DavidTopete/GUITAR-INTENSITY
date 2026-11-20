@@ -1280,6 +1280,13 @@ def validar(cfg):
             if not isinstance(cupo, int) or cupo < 0:
                 errores.append(f"calendario {dia}/{inst}: cupo debe ser entero >= 0")
 
+    minimo = cfg["publicacion"].get("minimo_diario", 0)
+    if not isinstance(minimo, int) or minimo < 0:
+        errores.append("publicacion.minimo_diario debe ser entero >= 0")
+    for inst in cfg["publicacion"].get("prioridad_relleno") or []:
+        if inst not in instrumentos:
+            errores.append(f"prioridad_relleno: instrumento desconocido '{inst}'")
+
     temas = cfg["telegram"].get("temas") or {}
     destinos_validos = set(instrumentos) | {"destacadas", "estado"}
     for destino in temas:
@@ -1847,7 +1854,7 @@ class Publicador:
         self.envio_caido = False
         self.fallos_envio_consecutivos = 0
         self.stats = {"por_destino": {}, "descartadas_traduccion": 0, "fallos_envio": 0,
-                      "omitidas_sin_traductor": 0, "breaker": ""}
+                      "omitidas_sin_traductor": 0, "breaker": "", "relleno": 0}
 
     # ------------------------------------------------------------------
     # Puntuacion y seleccion
@@ -1877,10 +1884,18 @@ class Publicador:
     # Nucleo: publicar un lote en un destino
     # ------------------------------------------------------------------
 
-    def _publicar_lote(self, destino, grupos, cupo):
+    def _publicar_lote(self, destino, grupos, cupo, adicionales=None):
+        """Publica en `destino` hasta completar `cupo` del dia (contando lo ya
+        publicado hoy ahi). Con `adicionales`, publica como mucho esa cantidad
+        extra sin mirar el cupo (lo usa el relleno del minimo diario)."""
         ya_hoy = self.db.publicadas_desde(self.inicio_dia, destino=destino)
-        restante = max(0, cupo - len(ya_hoy))
+        if adicionales is None:
+            restante = max(0, cupo - len(ya_hoy))
+        else:
+            restante = adicionales
         registro = self.stats["por_destino"].setdefault(destino, {"publicadas": 0, "cupo": cupo})
+        if adicionales is not None:
+            registro["cupo"] = registro.get("cupo", 0) + adicionales
         registro["ya_publicadas_hoy"] = len(ya_hoy)
         if restante == 0:
             return 0
@@ -2039,6 +2054,41 @@ class Publicador:
             total += self._publicar_lote(instrumento, candidatos, int(cupo))
         return total
 
+    def relleno(self):
+        """Garantiza `minimo_diario` noticias en el dia (sumando todos los
+        temas, incluidas las destacadas). Si falta, publica la mejor pendiente
+        de cada instrumento por turnos, en el orden de `prioridad_relleno`
+        (guitarra primero), cada una en el tema de SU instrumento.
+        Si no queda nada pendiente o publicable, se detiene sin forzar."""
+        minimo = int(self.pcfg.get("minimo_diario", 0) or 0)
+        if minimo <= 0:
+            return 0
+        faltan = minimo - len(self.db.publicadas_desde(self.inicio_dia))
+        if faltan <= 0:
+            return 0
+        orden = [i for i in (self.pcfg.get("prioridad_relleno") or list(self.cfg["instrumentos"]))
+                 if i in self.cfg["instrumentos"]]
+        desde = self.ahora - timedelta(days=self.cfg["general"].get("dias_en_pool", 10))
+        log.info(f"Minimo diario: faltan {faltan} de {minimo}; se completa con {orden}")
+        total = 0
+        agotados = set()
+        while faltan > 0 and not self.envio_caido and len(agotados) < len(orden):
+            for inst in orden:
+                if faltan <= 0 or self.envio_caido:
+                    break
+                if inst in agotados:
+                    continue
+                n = self._publicar_lote(inst, self.db.pendientes(desde, instrumento=inst),
+                                        cupo=0, adicionales=1)
+                if n == 0:
+                    agotados.add(inst)
+                total += n
+                faltan -= n
+        if faltan > 0:
+            log.warning(f"Minimo diario no alcanzado: faltaron {faltan} (sin noticias publicables)")
+        self.stats["relleno"] = total
+        return total
+
     def indice_semanal(self, dia=None):
         icfg = self.pcfg.get("indice_semanal", {})
         dia = dia or nombre_dia(self.local)
@@ -2071,6 +2121,7 @@ class Publicador:
         log.info(f"Publicacion del {dia} {self.local:%d/%m/%Y %H:%M}")
         self.destacadas()
         self.calendario(dia)
+        self.relleno()
         self.indice_semanal(dia)
         self.stats["breaker"] = self.breaker.motivo
         self.stats["dia"] = dia
@@ -2421,17 +2472,19 @@ CONFIG_INTEGRADA = {'general': {'zona_horaria': 'America/Tijuana',
                  'texto_encima_de_la_foto': True,
                  'alerta_feed_fallos': 2,
                  'reporte_estado': True,
-                 'calendario': {'lunes': {'guitarra': 5},
-                                'martes': {'bajo': 4},
-                                'miercoles': {'teclados': 4},
-                                'jueves': {'bateria': 4},
-                                'viernes': {'proaudio': 4},
-                                'sabado': {'guitarra': 5, 'bajo': 3},
-                                'domingo': {'guitarra': 2,
+                 'calendario': {'lunes': {'guitarra': 6},
+                                'martes': {'bajo': 6},
+                                'miercoles': {'teclados': 6},
+                                'jueves': {'bateria': 6},
+                                'viernes': {'proaudio': 6},
+                                'sabado': {'guitarra': 3, 'bajo': 3},
+                                'domingo': {'guitarra': 1,
                                             'bajo': 1,
                                             'teclados': 1,
                                             'bateria': 1,
                                             'proaudio': 1}},
+                 'minimo_diario': 6,
+                 'prioridad_relleno': ['guitarra', 'bajo', 'teclados', 'bateria', 'proaudio'],
                  'destacadas': {'activo': True,
                                 'emoji': '⭐',
                                 'encabezado': 'NOTICIAS DESTACADAS',

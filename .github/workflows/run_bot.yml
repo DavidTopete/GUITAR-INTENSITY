@@ -93,7 +93,65 @@ jobs:
         env:
           EVENTO: ${{ github.event_name }}
           HORARIO: ${{ github.event.schedule }}
-          ENTRADA_CMD: ${{ github.event.inputs.comando }}
-          ENTRADA_DRY: ${{ github.event.inputs.dry_run }}
+          MANUAL: ${{ github.event.inputs.comando }}
+          DRY: ${{ github.event.inputs.dry_run }}
         run: |
-          if [
+          CMD=recolectar
+          if [ "$HORARIO" = "43 14 * * *" ]; then CMD=diario; fi
+          if [ "$EVENTO" = "workflow_dispatch" ]; then CMD="$MANUAL"; fi
+          case "$CMD" in
+            diario|recolectar|publicar|estado|validar-feeds) ;;
+            *) echo "Comando no permitido: $CMD"; exit 1 ;;
+          esac
+          if [ "$DRY" = "true" ]; then CMD="$CMD --dry-run"; fi
+          echo "Comando: $CMD"
+          echo "cmd=$CMD" >> "$GITHUB_OUTPUT"
+
+
+      # ======================================================
+      # 6. EJECUTAR BOT
+      # ======================================================
+      - name: Run Guitar Gear News Bot
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python telegram_bot.py ${{ steps.cmd.outputs.cmd }}
+
+
+      # ======================================================
+      # 7. GUARDAR ESTADO DEL BOT
+      #    Se ejecuta aunque el paso anterior falle, para no
+      #    perder lo que ya se publico (evita repeticiones).
+      # ======================================================
+      - name: Save bot state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "Checking bot state files..."
+
+          # gear_news.db: noticias pendientes, duplicados e historial
+          # noticias_enviadas.json: URLs ya publicadas (respaldo)
+          for archivo in gear_news.db noticias_enviadas.json; do
+            if [ -f "$archivo" ]; then
+              git add "$archivo"
+            fi
+          done
+
+          if git diff --cached --quiet; then
+            echo "No changes in bot state."
+            exit 0
+          fi
+
+          echo "Changes detected."
+
+          git commit -m "Update bot state"
+
+          echo "Updating local repository..."
+          git pull --rebase origin main
+
+          echo "Pushing updated bot state..."
+          git push origin HEAD:main
+
+          echo "Guitar Gear News Bot state successfully updated."

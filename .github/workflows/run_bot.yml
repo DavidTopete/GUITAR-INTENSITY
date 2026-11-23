@@ -2,15 +2,28 @@ name: Guitar Gear News Bot
 
 on:
   schedule:
-    # 10:17 AM San Luis Río Colorado / Sonora
-    # Sonora = UTC-7
-    # 10:17 AM = 17:17 UTC
-    # Se usa :17 para reducir retrasos de GitHub Actions
+    # Publicacion diaria: 7:43 AM San Luis Rio Colorado / Sonora
+    # Sonora = UTC-7 todo el año (no cambia de horario)
+    # 7:43 AM = 14:43 UTC
+    # Se usa :43 para reducir retrasos de GitHub Actions
     # que suelen ocurrir al inicio de cada hora.
-    - cron: '17 17 * * *'
+    - cron: '43 14 * * *'
+
+    # Recoleccion de noticias cada 6 horas (no publica nada).
+    # Evita perder noticias de los feeds que solo muestran sus
+    # ultimas entradas en los dias que no toca publicar.
+    # 00:13, 06:13, 12:13 y 18:13 UTC
+    - cron: '13 */6 * * *'
 
   # Permite ejecutar manualmente desde GitHub Actions
   workflow_dispatch:
+    inputs:
+      comando:
+        description: 'diario | recolectar | publicar | estado | validar-feeds'
+        default: 'diario'
+      dry_run:
+        description: 'Simular sin enviar a Telegram (true/false)'
+        default: 'false'
 
 permissions:
   contents: write
@@ -22,6 +35,7 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
 
@@ -54,8 +68,8 @@ jobs:
           echo "UTC time:"
           date -u
           echo ""
-          echo "Runner time:"
-          date
+          echo "Sonora time:"
+          TZ=America/Hermosillo date
           echo "========================================"
 
 
@@ -69,41 +83,17 @@ jobs:
 
 
       # ======================================================
-      # 5. EJECUTAR BOT
+      # 5. ELEGIR COMANDO
+      #    - cron de las 14:43 UTC  -> diario (recolecta y publica)
+      #    - cron cada 6 horas      -> recolectar (no publica)
+      #    - ejecucion manual       -> el comando elegido
       # ======================================================
-      - name: Run Guitar Gear News Bot
+      - name: Choose command
+        id: cmd
         env:
-          TOKEN: ${{ secrets.TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python telegram_bot.py
-
-
-      # ======================================================
-      # 6. GUARDAR ESTADO DEL BOT
-      # ======================================================
-      - name: Save bot state
+          EVENTO: ${{ github.event_name }}
+          HORARIO: ${{ github.event.schedule }}
+          ENTRADA_CMD: ${{ github.event.inputs.comando }}
+          ENTRADA_DRY: ${{ github.event.inputs.dry_run }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          echo "Checking bot state files..."
-
-          git add noticias_enviadas.json
-          git add fuente_estado.json
-
-          if git diff --cached --quiet; then
-            echo "No changes in bot state."
-            exit 0
-          fi
-
-          echo "Changes detected."
-
-          git commit -m "Update bot state"
-
-          echo "Updating local repository..."
-          git pull --rebase origin main
-
-          echo "Pushing updated bot state..."
-          git push origin HEAD:main
-
-          echo "Guitar Gear News Bot state successfully updated."
+          if [

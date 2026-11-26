@@ -2,18 +2,12 @@ name: Guitar Gear News Bot
 
 on:
   schedule:
-    # Publicacion diaria: 7:43 AM San Luis Rio Colorado / Sonora
+    # Ejecucion unica diaria: 1:47 AM San Luis Rio Colorado / Sonora
     # Sonora = UTC-7 todo el año (no cambia de horario)
-    # 7:43 AM = 14:43 UTC
-    # Se usa :43 para reducir retrasos de GitHub Actions
+    # 1:47 AM = 08:47 UTC
+    # Se usa :47 para reducir retrasos de GitHub Actions
     # que suelen ocurrir al inicio de cada hora.
-    - cron: '43 14 * * *'
-
-    # Recoleccion de noticias cada 6 horas (no publica nada).
-    # Evita perder noticias de los feeds que solo muestran sus
-    # ultimas entradas en los dias que no toca publicar.
-    # 00:13, 06:13, 12:13 y 18:13 UTC
-    - cron: '13 */6 * * *'
+    - cron: '47 8 * * *'
 
   # Permite ejecutar manualmente desde GitHub Actions
   workflow_dispatch:
@@ -84,26 +78,31 @@ jobs:
 
       # ======================================================
       # 5. ELEGIR COMANDO
-      #    - cron de las 14:43 UTC  -> diario (recolecta y publica)
-      #    - cron cada 6 horas      -> recolectar (no publica)
-      #    - ejecucion manual       -> el comando elegido
+      #    - Ejecucion programada -> diario
+      #    - Ejecucion manual     -> comando elegido
       # ======================================================
       - name: Choose command
         id: cmd
         env:
           EVENTO: ${{ github.event_name }}
-          HORARIO: ${{ github.event.schedule }}
           MANUAL: ${{ github.event.inputs.comando }}
           DRY: ${{ github.event.inputs.dry_run }}
         run: |
-          CMD=recolectar
-          if [ "$HORARIO" = "43 14 * * *" ]; then CMD=diario; fi
-          if [ "$EVENTO" = "workflow_dispatch" ]; then CMD="$MANUAL"; fi
+          CMD=diario
+
+          if [ "$EVENTO" = "workflow_dispatch" ]; then
+            CMD="$MANUAL"
+          fi
+
           case "$CMD" in
             diario|recolectar|publicar|estado|validar-feeds) ;;
             *) echo "Comando no permitido: $CMD"; exit 1 ;;
           esac
-          if [ "$DRY" = "true" ]; then CMD="$CMD --dry-run"; fi
+
+          if [ "$DRY" = "true" ]; then
+            CMD="$CMD --dry-run"
+          fi
+
           echo "Comando: $CMD"
           echo "cmd=$CMD" >> "$GITHUB_OUTPUT"
 
